@@ -1,0 +1,458 @@
+---
+title: "Diagnostic Ultrasound Device Events and Recalls"
+author: "Amelia Cotto Marquez"
+format: typst
+editor: visual
+---
+
+```{r}
+#| message: false
+#| warning: false
+
+library(tidyverse)
+library(jsonlite)
+library(httr2)
+library(lubridate)
+
+ultrasound_codes <- c("IYN", "IYO", "ITX")
+
+```
+
+## Data Collection
+For this project, I used diagnostic ultrasound device data from three different sources: FDA MAUDE adverse event reports, FDA medical device recall data, and AccessGUDID device information. I focused on three diagnostic ultrasound product codes: IYN for pulsed Doppler ultrasound systems, IYO for pulsed echo ultrasound systems, and ITX for diagnostic ultrasound transducers. I used 2025 MAUDE data so the project would stay manageable while still having enough records to analyze.
+
+```{r}
+
+maude_all <- data.frame()
+
+for (skip_num in seq(0, 1600, by = 100)) {
+
+  url <- paste0(
+    "https://api.fda.gov/device/event.json?",
+    "search=(device.device_report_product_code:IYN",
+    "+device.device_report_product_code:IYO",
+    "+device.device_report_product_code:ITX)",
+    "+AND+date_received:[20250101+TO+20251231]",
+    "&limit=100",
+    "&skip=", skip_num
+  )
+
+  batch <- fromJSON(url)$results
+
+  maude_all <- bind_rows(maude_all, batch)
+}
+
+```
+
+```{r}
+saveRDS(maude_all, "maude_ultrasound_2025_raw.rds")
+
+```
+
+## Cleaning the MAUDE Data
+The MAUDE data came from the FDA API as JSON and contained several nested fields, missing values, and repeated information. I first pulled out the device information I needed, including the brand name, manufacturer, model number, product code, and UDI. I then converted blank strings and values such as "N/A" into missing values so they would be handled consistently. I also removed duplicate product problem labels within each report and converted the event dates into actual date variables. Manufacturer names were only standardized when the differences were clearly formatting or spelling variations.
+
+```{r}
+maude_clean <- maude_all %>%
+  mutate(
+    brand_name = map_chr(device, ~ .x$brand_name[1]),
+    generic_name = map_chr(device, ~ .x$generic_name[1]),
+    manufacturer = map_chr(device, ~ .x$manufacturer_d_name[1]),
+    model_number = map_chr(device, ~ .x$model_number[1]),
+    product_code = map_chr(device, ~ .x$device_report_product_code[1]),
+    udi = map_chr(device, ~ .x$udi_di[1])
+  )
+
+
+```
+
+```{r}
+maude_clean <- maude_clean %>%
+  mutate(
+    brand_name = na_if(brand_name, ""),
+    manufacturer = na_if(manufacturer, ""),
+    model_number = na_if(model_number, ""),
+    model_number = na_if(model_number, "N/A"),
+    udi = na_if(udi, "")
+  )
+
+```
+
+```{r}
+maude_clean %>%
+  summarise(
+    missing_brand = sum(is.na(brand_name)),
+    missing_manufacturer = sum(is.na(manufacturer)),
+    missing_model = sum(is.na(model_number)),
+    missing_udi = sum(is.na(udi))
+  )
+
+
+```
+
+```{r}
+maude_clean <- maude_clean %>%
+  mutate(
+    product_problems_clean = map(product_problems, unique)
+  )
+
+```
+
+```{r}
+maude_problems <- maude_clean %>%
+  select(report_number, product_problems_clean) %>%
+  unnest_longer(
+    product_problems_clean,
+    values_to = "product_problem"
+  ) %>%
+  filter(!is.na(product_problem)) %>%
+  distinct()
+
+
+```
+
+```{r}
+maude_clean <- maude_clean %>%
+  mutate(
+    date_of_event = ymd(date_of_event),
+    date_received = ymd(date_received)
+  )
+
+
+```
+
+
+```{r}
+maude_clean <- maude_clean %>%
+  mutate(
+    manufacturer_clean = case_when(
+      manufacturer %in% c(
+        "PHILIPS ULTRASOUND LLC",
+        "PHILIPS ULTRASOUND LLC.",
+        "PHILLIPS / PHILIPS ULTRASOUND LLC"
+      ) ~ "PHILIPS ULTRASOUND LLC",
+      TRUE ~ manufacturer
+    )
+  )
+
+```
+
+```{r}
+saveRDS(maude_clean, "maude_ultrasound_2025_clean.rds")
+saveRDS(maude_problems, "maude_ultrasound_2025_problems.rds")
+
+```
+
+## Cleaning the Recall Data
+The FDA recall data also came from an API, but it had a different structure than the MAUDE data. I converted the recall initiation date into a date variable and cleaned the long product description and recall reason fields by removing extra spaces and line breaks. I also standardized obvious variations in recalling firm names, such as different versions of Philips Ultrasound and CIVCO Medical Instruments. I kept other company names separate when I could not be sure they represented the same legal entity.
+
+```{r}
+recall_url <- paste0(
+  "https://api.fda.gov/device/recall.json?",
+  "search=(product_code:IYN",
+  "+product_code:IYO",
+  "+product_code:ITX)",
+  "&limit=530"
+)
+
+recall_all <- fromJSON(recall_url)$results
+
+
+```
+
+```{r}
+saveRDS(recall_all, "fda_ultrasound_recalls_raw.rds")
+
+```
+
+```{r}
+recall_clean <- recall_all %>%
+  mutate(
+    event_date_initiated = ymd(event_date_initiated)
+  )
+
+```
+
+```{r}
+recall_clean <- recall_clean %>%
+  mutate(
+    product_description = str_squish(product_description),
+    reason_for_recall = str_squish(reason_for_recall)
+  )
+
+```
+
+```{r}
+recall_clean <- recall_clean %>%
+  mutate(
+    recalling_firm_clean = case_when(
+      recalling_firm %in% c(
+        "Philips Ultrasound, Inc",
+        "Philips Ultrasound, Inc.",
+        "Philips Ultrasound Inc"
+      ) ~ "Philips Ultrasound, Inc.",
+
+      recalling_firm %in% c(
+        "Civco Medical Instruments Co. Inc.",
+        "CIVCO Medical Instruments Co., Inc.",
+        "Civco Medical Instruments Inc"
+      ) ~ "CIVCO Medical Instruments Co., Inc.",
+
+      TRUE ~ recalling_firm
+    )
+  )
+
+```
+
+```{r}
+saveRDS(recall_clean, "fda_ultrasound_recalls_clean.rds")
+
+```
+
+## Adding AccessGUDID Device Information
+The MAUDE data included UDI values for some reports, so I used AccessGUDID as a third source to add more device information. Because there were many repeated UDI values, I focused on the most common ones instead of making a separate API request for every report. I used the UDI to look up the device brand, model, and company name. Some UDI values did not return a match, so those values were left missing instead of forcing a match.
+
+```{r}
+maude_clean %>%
+  summarise(
+    total_reports = n(),
+    reports_with_udi = sum(!is.na(udi)),
+    unique_udis = n_distinct(udi, na.rm = TRUE)
+  )
+
+
+```
+
+```{r}
+top_udis <- maude_clean %>%
+  filter(!is.na(udi)) %>%
+  count(udi, sort = TRUE) %>%
+  slice_head(n = 20)
+
+```
+
+```{r}
+top_udi_list <- top_udis %>%
+  slice_head(n = 10) %>%
+  pull(udi)
+
+```
+
+```{r}
+
+gudid_top10 <- list()
+
+gudid_top10 <- vector("list", length(top_udi_list))
+
+for (i in seq_along(top_udi_list)) {
+
+  url <- paste0(
+    "https://accessgudid.nlm.nih.gov/api/v2/devices/lookup.json?di=",
+    top_udi_list[i]
+  )
+
+  gudid_result <- tryCatch(
+    suppressWarnings(fromJSON(url)),
+    error = function(e) NULL
+  )
+
+  gudid_top10[i] <- list(gudid_result)
+}
+
+```
+
+```{r}
+gudid_clean <- map2_dfr(top_udi_list, gudid_top10, function(udi_value, x) {
+
+  if (is.null(x)) {
+    return(tibble(
+      udi = udi_value,
+      gudid_brand = NA_character_,
+      gudid_model = NA_character_,
+      gudid_company = NA_character_
+    ))
+  }
+
+  tibble(
+    udi = udi_value,
+    gudid_brand = x$gudid$device$brandName,
+    gudid_model = x$gudid$device$versionModelNumber,
+    gudid_company = x$gudid$device$companyName
+  )
+})
+
+
+```
+
+```{r}
+saveRDS(gudid_clean, "accessgudid_ultrasound_clean.rds")
+
+```
+
+```{r}
+maude_enriched <- maude_clean %>%
+  left_join(gudid_clean, by = "udi")
+
+```
+
+```{r}
+saveRDS(maude_enriched, "maude_ultrasound_2025_enriched.rds")
+
+```
+
+## Preparing the Final Datasets
+After cleaning the individual sources, I created a common device type variable so the MAUDE and recall data could be compared using the same categories. I also limited the recall data to recalls initiated in 2025 so it matched the year used for the MAUDE reports. This made it possible to compare adverse event reports and recalls without mixing different time periods.
+
+```{r}
+maude_enriched <- maude_enriched %>%
+  mutate(
+    device_type = case_when(
+      product_code == "IYN" ~ "Pulsed Doppler Ultrasound System",
+      product_code == "IYO" ~ "Pulsed Echo Ultrasound System",
+      product_code == "ITX" ~ "Diagnostic Ultrasound Transducer"
+    )
+  )
+
+recall_clean <- recall_clean %>%
+  mutate(
+    device_type = case_when(
+      product_code == "IYN" ~ "Pulsed Doppler Ultrasound System",
+      product_code == "IYO" ~ "Pulsed Echo Ultrasound System",
+      product_code == "ITX" ~ "Diagnostic Ultrasound Transducer"
+    )
+  )
+
+```
+
+```{r}
+recall_2025 <- recall_clean %>%
+  filter(year(event_date_initiated) == 2025)
+
+```
+
+```{r}
+
+saveRDS(recall_2025, "fda_ultrasound_recalls_2025.rds")
+
+```
+
+## Results and Visualizations
+After the data was cleaned, I created summary tables and plots to compare the different ultrasound device types. I looked at the number and type of MAUDE reports, the root causes listed in the recall data, and the number of MAUDE reports compared with recalls for each device type. These summaries would not have been as easy to create from the original nested and inconsistent data.
+
+```{r}
+maude_summary <- maude_enriched %>%
+  count(device_type, event_type)
+
+maude_summary
+
+
+```
+
+```{r}
+
+ggplot(maude_summary,
+       aes(x = device_type, y = n, fill = event_type)) +
+  geom_col(position = "dodge") +
+  coord_flip() +
+  labs(
+    title = "2025 Ultrasound Device Events by Device Type",
+    x = "Device Type",
+    y = "Number of Reports",
+    fill = "Event Type"
+  ) +
+  theme_minimal()
+```
+
+```{r}
+recall_summary <- recall_2025 %>%
+  count(device_type, root_cause_description, sort = TRUE)
+
+recall_summary
+
+
+```
+
+```{r}
+#| fig-width: 9
+#| fig-height: 5
+
+ggplot(recall_summary,
+       aes(x = device_type, y = n, fill = root_cause_description)) +
+  geom_col() +
+  coord_flip() +
+  scale_y_continuous(breaks = seq(0, 80, by = 20)) +
+  labs(
+    title = "2025 Ultrasound Recalls by Device Type and Root Cause",
+    x = "Device Type",
+    y = "Number of Recalls",
+    fill = "Root Cause"
+  ) +
+  theme_minimal()
+
+```
+
+```{r}
+
+comparison_table <- maude_enriched %>%
+  count(device_type, name = "maude_reports") %>%
+  left_join(
+    recall_2025 %>%
+      count(device_type, name = "recalls"),
+    by = "device_type"
+  ) %>%
+  mutate(
+    recalls = replace_na(recalls, 0)
+  )
+
+comparison_table
+
+```
+
+## Final Thoughts
+This project showed how much cleaning was needed before the ultrasound device data could be compared and visualized. The three sources had different structures, missing values, inconsistent company names, nested fields, and repeated information. After cleaning and standardizing the data, I was able to compare MAUDE reports and recalls by device type and create summaries that were much easier to understand.
+
+```{r}
+maude_final <- maude_enriched %>%
+  select(
+    report_number,
+    event_type,
+    date_of_event,
+    date_received,
+    brand_name,
+    manufacturer_clean,
+    model_number,
+    product_code,
+    device_type,
+    udi,
+    gudid_brand,
+    gudid_model,
+    gudid_company
+  )
+
+
+```
+
+```{r}
+recall_final <- recall_2025 %>%
+  select(
+    product_res_number,
+    product_code,
+    device_type,
+    recalling_firm_clean,
+    product_description,
+    reason_for_recall,
+    root_cause_description,
+    event_date_initiated,
+    recall_status
+  )
+
+
+```
+
+```{r}
+write_csv(maude_final, "maude_ultrasound_2025_final.csv")
+
+write_csv(recall_final, "fda_ultrasound_recalls_2025_final.csv")
+
+```
+
